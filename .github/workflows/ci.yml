@@ -1,0 +1,246 @@
+name: CI - Basic API Tests
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  test:
+    name: Run Basic API Tests
+    runs-on: ubuntu-latest
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpassword
+          MYSQL_DATABASE: example_db
+          MYSQL_USER: example_user
+          MYSQL_PASSWORD: example_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -P 3306 -u root -prootpassword --protocol=TCP || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+          --health-start-period=20s
+
+      mongodb:
+        image: mongo:8.2.2
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd="mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis:
+        image: redis:8.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      zookeeper:
+        image: confluentinc/cp-zookeeper:7.7.7
+        env:
+          ZOOKEEPER_CLIENT_PORT: 2181
+          ZOOKEEPER_TICK_TIME: 2000
+        ports:
+          - 2181:2181
+        options: >-
+          --health-cmd="nc -z localhost 2181 || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      kafka:
+        image: confluentinc/cp-kafka:7.7.7
+        env:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://localhost:29092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd="kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Create .env file
+        run: |
+          cat > .env << EOF
+          # Server
+          SERVER_HOST=0.0.0.0
+          SERVER_PORT=8080
+          
+          # MySQL
+          MYSQL_HOST=localhost
+          MYSQL_PORT=3306
+          MYSQL_USER=example_user
+          MYSQL_PASSWORD=example_password
+          MYSQL_DATABASE=example_db
+          
+          # MongoDB
+          MONGODB_URI=mongodb://localhost:27017
+          MONGODB_DATABASE=example_db
+          
+          # Redis
+          REDIS_HOST=localhost
+          REDIS_PORT=6379
+          
+          # Kafka
+          KAFKA_BROKERS=localhost:9092
+          KAFKA_GROUP_ID=example_rust_service
+          
+          # JWT
+          JWT_SECRET=your-secret-key-change-this-in-production
+          JWT_EXPIRATION_HOURS=24
+          EOF
+
+      - name: Install database clients and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-mysql-client redis-tools netcat-openbsd
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for services to initialize..."
+          sleep 25
+          
+          # Wait for MySQL - check port first, then connection
+          echo "Waiting for MySQL..."
+          for i in {1..30}; do
+            # Check if port is open
+            if nc -z localhost 3306 2>/dev/null; then
+              # Try to connect with root user using TCP/IP explicitly
+              if mysqladmin ping -h 127.0.0.1 -P 3306 -u root -prootpassword --protocol=TCP --silent 2>/dev/null; then
+                echo "MySQL is ready!"
+                # Verify example_user can also connect
+                if mysqladmin ping -h 127.0.0.1 -P 3306 -u example_user -pexample_password --protocol=TCP --silent 2>/dev/null; then
+                  echo "MySQL example_user is ready!"
+                fi
+                break
+              else
+                echo "MySQL port is open but connection failed, retrying..."
+              fi
+            fi
+            if [ $i -eq 30 ]; then
+              echo "MySQL failed to start after 85 seconds"
+              echo "Debug info:"
+              echo "Port check:"
+              nc -zv localhost 3306 2>&1 || echo "Port 3306 not accessible"
+              echo "Trying root connection:"
+              mysqladmin ping -h 127.0.0.1 -P 3306 -u root -prootpassword --protocol=TCP 2>&1 || echo "Root connection failed"
+              exit 1
+            fi
+            echo "Waiting for MySQL... ($i/30)"
+            sleep 2
+          done
+          
+          # Wait for MongoDB (check if port is open)
+          echo "Waiting for MongoDB..."
+          for i in {1..30}; do
+            if nc -z localhost 27017 2>/dev/null; then
+              echo "MongoDB is ready!"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "MongoDB failed to start after 60 seconds"
+              exit 1
+            fi
+            echo "Waiting for MongoDB... ($i/30)"
+            sleep 2
+          done
+          
+          # Wait for Redis
+          echo "Waiting for Redis..."
+          for i in {1..30}; do
+            if redis-cli ping 2>/dev/null | grep -q PONG; then
+              echo "Redis is ready!"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "Redis failed to start after 60 seconds"
+              exit 1
+            fi
+            echo "Waiting for Redis... ($i/30)"
+            sleep 2
+          done
+          
+          # Wait for Zookeeper
+          echo "Waiting for Zookeeper..."
+          for i in {1..30}; do
+            if nc -z localhost 2181 2>/dev/null; then
+              echo "Zookeeper is ready!"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "Zookeeper failed to start after 60 seconds"
+              exit 1
+            fi
+            echo "Waiting for Zookeeper... ($i/30)"
+            sleep 2
+          done
+          
+          # Wait for Kafka (check if port is open)
+          echo "Waiting for Kafka..."
+          sleep 20
+          for i in {1..20}; do
+            if nc -z localhost 9092 2>/dev/null; then
+              echo "Kafka port is open!"
+              break
+            fi
+            if [ $i -eq 20 ]; then
+              echo "Kafka may not be fully ready, but continuing..."
+            fi
+            echo "Waiting for Kafka... ($i/20)"
+            sleep 3
+          done
+          
+          echo "All services are ready!"
+
+      - name: Run API tests
+        run: |
+          cargo test --test api_test -- --nocapture
+        env:
+          RUST_LOG: info
+          RUST_BACKTRACE: 1
+          # Allow tests to continue even if Kafka is not fully ready
+          KAFKA_BROKERS: localhost:9092
